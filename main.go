@@ -1,7 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -21,36 +24,14 @@ func main() {
 	g.Connect(2, 3)
 	g.Connect(3, 1)
 
-	fmt.Printf("%+v\n", g.edges)
-
-	for _, v := range g.TopSort() {
+	rand.Seed(time.Now().Unix())
+	err := g.ParTopSortWalk(5, func(v int) {
 		fmt.Printf("%d ", v)
+		time.Sleep(1 * time.Second)
+	})
+	if err != nil {
+		panic(err)
 	}
-	fmt.Println()
-
-	iter := NewIter(&g)
-	for iter.HasNext() {
-		fmt.Printf("%d ", iter.Next())
-	}
-	fmt.Println()
-
-	pariter := NewParIter(&g)
-	readyCh := pariter.Ready()
-	fmt.Printf("%d ", <-readyCh)
-	fmt.Printf("%d ", <-readyCh)
-	pariter.Complete(2)
-	fmt.Printf("%d ", <-readyCh)
-	pariter.Complete(3)
-	pariter.Complete(4)
-	fmt.Printf("%d ", <-readyCh)
-	pariter.Complete(5)
-	fmt.Printf("%d ", <-readyCh)
-	fmt.Printf("%d ", <-readyCh)
-	pariter.Complete(0)
-	pariter.Complete(1)
-	// chan already closed
-	<-readyCh
-	fmt.Println()
 }
 
 type Graph[T comparable] struct {
@@ -106,6 +87,128 @@ func (g *Graph[T]) TopSort() []T {
 	return sorted
 }
 
+func (g *Graph[T]) TopSortWalk(fn func(v T) error) {
+	indegree := map[T]int{}
+
+	for _, deps := range g.edges {
+		for _, u := range deps {
+			indegree[u]++
+		}
+	}
+
+	q := []T{}
+	for v := range g.edges {
+		if indegree[v] == 0 {
+			q = append(q, v)
+		}
+	}
+
+	cnt := 0
+	for len(q) > 0 {
+		v := q[0]
+		q = q[1:]
+		// exit early
+		if err := fn(v); err != nil {
+			return
+		}
+
+		for _, u := range g.edges[v] {
+			indegree[u]--
+			if indegree[u] == 0 {
+				q = append(q, u)
+			}
+		}
+		cnt++
+	}
+
+	if cnt != len(g.v) {
+		panic("cycle detected")
+	}
+}
+
+// ParTopSortWalk walks the graph in topologically sorted order calling fn in
+// parallel. Control goroutine concurrency through the "c" parameter.
+// Implements Kahn’s algorithm.
+func (g *Graph[T]) ParTopSortWalk(c int, fn func(v T)) error {
+	if len(g.v) == 0 {
+		return nil
+	}
+
+	indegree := map[T]int{}
+
+	for _, deps := range g.edges {
+		for _, u := range deps {
+			indegree[u]++
+		}
+	}
+
+	// this must be buffered since the main goroutine and executor goroutines
+	// do not deadlock since they are communicating back and forth over the
+	// following two channels
+	readyCh := make(chan T, len(g.v))
+	done := make(chan T)
+
+	var wg sync.WaitGroup
+	wg.Add(c)
+	for i := 0; i < c; i++ {
+		go func() {
+			defer wg.Done()
+			for v := range readyCh {
+				fn(v)
+				done <- v
+			}
+		}()
+	}
+
+	outstanding := 0
+	// add all source nodes (nodes that have no inbound edges)
+	for v := range g.edges {
+		if indegree[v] == 0 {
+			outstanding++
+			readyCh <- v
+		}
+	}
+
+	// if we get to this point we know there are verticies in the graph so if
+	// we didn't enqueue any verticies for processing then the graph must be
+	// made of no source edges (i.e. all verticies form one large cycle)
+	if outstanding == 0 {
+		return errors.New("cycle detected")
+	}
+
+	completed := 0
+	// processing of v has finished
+	for v := range done {
+		// notify all of v's dependents that it has finished
+		for _, u := range g.edges[v] {
+			indegree[u]--
+			if indegree[u] == 0 {
+				// u has no more requirements, it is now a source vertex,
+				// process it
+				outstanding++
+				readyCh <- u
+			}
+		}
+
+		completed++
+		outstanding--
+		// this indicates that the "queue" is empty
+		if outstanding == 0 {
+			break
+		}
+	}
+	close(done)
+	close(readyCh)
+	wg.Wait()
+
+	// if we didn't process all verticies then there must have been a cycle
+	if completed != len(g.v) {
+		return errors.New("cycle detected")
+	}
+
+	return nil
+}
+
 type Iter[T comparable] struct {
 	g        *Graph[T]
 	indegree map[T]int
@@ -151,70 +254,4 @@ func (i *Iter[T]) Next() T {
 	}
 
 	return v
-}
-
-type ParIter[T comparable] struct {
-	g        *Graph[T]
-	indegree map[T]int
-	q        []T
-	ready    chan T
-	msg      chan T
-}
-
-func NewParIter[T comparable](g *Graph[T]) *ParIter[T] {
-	indegree := map[T]int{}
-
-	for _, deps := range g.edges {
-		for _, u := range deps {
-			indegree[u]++
-		}
-	}
-
-	readyCh := make(chan T, len(g.edges))
-	for v := range g.edges {
-		if indegree[v] == 0 {
-			readyCh <- v
-		}
-	}
-
-	iter := &ParIter[T]{
-		g:        g,
-		indegree: indegree,
-		ready:    readyCh,
-		msg:      make(chan T),
-	}
-	go iter.run()
-	return iter
-}
-
-func (i *ParIter[T]) Ready() <-chan T {
-	return i.ready
-}
-
-func (i *ParIter[T]) Complete(v T) {
-	i.msg <- v
-}
-
-func (i *ParIter[T]) run() {
-	cnt := 0
-Loop:
-	for {
-		select {
-		case v := <-i.msg:
-			for _, u := range i.g.edges[v] {
-				i.indegree[u]--
-				if i.indegree[u] == 0 {
-					i.ready <- u
-				}
-			}
-			cnt++
-
-			if cnt == len(i.g.v) {
-				close(i.ready)
-				break Loop
-			}
-		default:
-			time.Sleep(1 * time.Millisecond)
-		}
-	}
 }
